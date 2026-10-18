@@ -477,10 +477,22 @@ def get_juventus_europa_matches(date_string: str) -> list:
         params={"date": date_string, "limit": 100},
         timeout=20,
     )
+    if response.status_code >= 400:
+        # Il corpo dell'errore dice se e' il limite mensile, la chiave, ecc.
+        print(f"[EUROPA LEAGUE] HTTP {response.status_code}: {response.text[:300]}")
     response.raise_for_status()
+    payload = response.json()
     matches = []
 
-    for match in extract_footballdata_matches(response.json()):
+    # Quota API: cosi' nei log si vede sempre quante richieste restano.
+    api_meta = payload.get("meta") if isinstance(payload, dict) else None
+    if isinstance(api_meta, dict):
+        print(
+            f"[EUROPA LEAGUE] Quota API: {api_meta.get('requests_used')}/"
+            f"{api_meta.get('requests_limit')} (piano {api_meta.get('plan')})"
+        )
+
+    for match in extract_footballdata_matches(payload):
         home = footballdata_team_name(match.get("home_team"))
         away = footballdata_team_name(match.get("away_team"))
 
@@ -494,6 +506,241 @@ def get_juventus_europa_matches(date_string: str) -> list:
     return matches
 
 
+# ------------------------------------------------------------
+# EUROPA LEAGUE: fonte di RISERVA (TheSportsDB)
+# ------------------------------------------------------------
+# Si usa quando footballdata.io non risponde (es. 429 = limite richieste
+# mensile) oppure non conosce la partita. TheSportsDB e' gratuito e senza
+# limite mensile (solo 30 richieste al minuto).
+
+# ID della UEFA Europa League su TheSportsDB (thesportsdb.com/season/4481-uefa-europa-league)
+EUROPA_LEAGUE_SPORTSDB_ID = "4481"
+
+
+def sportsdb_event_start(event: dict):
+    """Orario d'inizio (ISO 8601 UTC) di un evento di TheSportsDB, oppure None.
+
+    `strTimestamp` e' in UTC ma SENZA indicazione del fuso, per esempio
+    "2014-12-29T20:00:00": con le funzioni orarie del bot (che lavorano con
+    orari "aware") quel formato non veniva mai riconosciuto. Qui lo si
+    normalizza sempre a UTC. In mancanza, si usano dateEvent + strTime.
+    """
+    candidates = []
+    timestamp = event.get("strTimestamp")
+    if timestamp:
+        candidates.append(str(timestamp))
+    if event.get("dateEvent") and event.get("strTime"):
+        candidates.append(f"{event['dateEvent']}T{event['strTime']}")
+
+    for value in candidates:
+        if len(value) <= 10:  # solo la data, senza ora
+            continue
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc).isoformat()
+
+    return None
+
+
+def is_juventus_sportsdb_event(event: dict, league_id: str) -> bool:
+    if str(event.get("idLeague", "")) != str(league_id):
+        return False
+    if str(event.get("strPostponed", "")).lower() == "yes":
+        return False
+    return is_juventus(event.get("strHomeTeam", "")) or is_juventus(event.get("strAwayTeam", ""))
+
+
+def get_juventus_europa_events_sportsdb(date_string: str) -> list:
+    """Partite della Juventus in Europa League del giorno, da TheSportsDB.
+
+    Solleva un errore solo se NESSUNA delle due richieste ha ricevuto risposta.
+    """
+    found = {}
+    answered = False
+    last_error = None
+
+    attempts = (
+        # 1) tutti gli eventi della Europa League in quella data
+        ("eventsday.php", {"d": date_string, "l": EUROPA_LEAGUE_SPORTSDB_ID}),
+        # 2) ricerca per nome squadra
+        ("searchevents.php", {"e": "Juventus", "d": date_string}),
+    )
+    for endpoint, params in attempts:
+        try:
+            response = requests.get(f"{SPORTSDB_BASE}/{endpoint}", params=params, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+        except (requests.RequestException, ValueError) as error:
+            last_error = error
+            print(f"[EUROPA LEAGUE] TheSportsDB {endpoint}: {error}")
+            continue
+
+        answered = True
+        events = []
+        if isinstance(data, dict):
+            events = data.get("events") or data.get("event") or []
+        for event in events:
+            event_id = str(event.get("idEvent") or "")
+            if event_id and is_juventus_sportsdb_event(event, EUROPA_LEAGUE_SPORTSDB_ID):
+                found[event_id] = event
+
+    if not answered and last_error is not None:
+        raise last_error
+    return list(found.values())
+
+
+def europa_candidates_from_footballdata(matches: list) -> list:
+    """Porta le partite di footballdata.io in un formato comune."""
+    candidates = []
+    for match in matches:
+        match_id = match.get("match_id") or match.get("id")
+        if match_id is None:
+            continue
+        round_name = match.get("round") or match.get("game_week")
+        candidates.append({
+            "source": "footballdata.io",
+            "key": f"uel_pre:{match_id}",
+            "home": footballdata_team_name(match.get("home_team")),
+            "away": footballdata_team_name(match.get("away_team")),
+            "utc": footballdata_match_start(match),
+            "detail": f"📅 {round_name}" if round_name else None,
+            "attribution": "Dati: Footballdata.io",
+            "fields": sorted(match.keys()),
+        })
+    return candidates
+
+
+def europa_candidates_from_sportsdb(events: list) -> list:
+    """Porta gli eventi di TheSportsDB nello stesso formato comune."""
+    candidates = []
+    for event in events:
+        round_value = str(event.get("intRound") or "")
+        has_round = round_value.isdigit() and 0 < int(round_value) < 100
+        candidates.append({
+            "source": "TheSportsDB",
+            # prefisso "tsdb" per non confondere gli ID con quelli di footballdata.io
+            "key": f"uel_pre:tsdb{event.get('idEvent')}",
+            "home": event.get("strHomeTeam", ""),
+            "away": event.get("strAwayTeam", ""),
+            "utc": sportsdb_event_start(event),
+            "detail": f"📅 Giornata {round_value}" if has_round else None,
+            "attribution": "Dati: TheSportsDB",
+            "fields": sorted(event.keys()),
+        })
+    return candidates
+
+
+def describe_error(error: Exception) -> str:
+    if isinstance(error, requests.HTTPError) and getattr(error, "response", None) is not None:
+        return f"HTTP {error.response.status_code}"
+    return f"{type(error).__name__}: {error}"[:200]
+
+
+def is_http_429(error: Exception) -> bool:
+    return (
+        isinstance(error, requests.HTTPError)
+        and getattr(error, "response", None) is not None
+        and error.response.status_code == 429
+    )
+
+
+def query_europa_sources(today: str, notified: set, force: bool):
+    """Interroga footballdata.io (principale) e, se serve, TheSportsDB (riserva).
+
+    Ritorna (candidati, stato_principale, stato_riserva, errori, changed) dove
+    gli stati sono "ok", "errore" o "saltata". `changed` = e' cambiato `notified`.
+    Con force=True (test manuale) vengono sempre interrogate entrambe le fonti.
+    """
+    candidates = []
+    errors = {}
+    changed = False
+    primary = "saltata"
+    backup = "saltata"
+    fdio_off_key = f"uel_fdio429:{today}"
+
+    # --- fonte principale: footballdata.io ---
+    if not FOOTBALLDATA_IO_KEY:
+        errors["footballdata.io"] = "chiave FOOTBALLDATA_IO_KEY mancante"
+    elif not force and fdio_off_key in notified:
+        errors["footballdata.io"] = "limite richieste raggiunto (429), la salto per oggi"
+    else:
+        try:
+            candidates += europa_candidates_from_footballdata(get_juventus_europa_matches(today))
+            primary = "ok"
+        except Exception as error:
+            primary = "errore"
+            errors["footballdata.io"] = describe_error(error)
+            print(f"::warning title=Europa League - footballdata.io::{describe_error(error)}")
+            if is_http_429(error) and not force:
+                # Inutile insistere per il resto della giornata: si usa la riserva.
+                notified.add(fdio_off_key)
+                changed = True
+
+    # --- fonte di riserva: TheSportsDB ---
+    if force or primary != "ok" or not candidates:
+        try:
+            candidates += europa_candidates_from_sportsdb(get_juventus_europa_events_sportsdb(today))
+            backup = "ok"
+        except Exception as error:
+            backup = "errore"
+            errors["TheSportsDB"] = describe_error(error)
+            print(f"::warning title=Europa League - TheSportsDB::{describe_error(error)}")
+
+    return candidates, primary, backup, errors, changed
+
+
+def describe_europa_candidate(candidate: dict) -> str:
+    home = html.escape(candidate["home"])
+    away = html.escape(candidate["away"])
+    utc = candidate["utc"]
+    if not utc:
+        return f"• {home} - {away} ⚠️ ORARIO NON LEGGIBILE (campi: {html.escape(', '.join(candidate['fields']))})"
+
+    kickoff = datetime.fromisoformat(utc)
+    minutes = int((kickoff - datetime.now(timezone.utc)).total_seconds() // 60)
+    local = kickoff.astimezone(ITALY_TZ).strftime("%H:%M") if ITALY_TZ else kickoff.strftime("%H:%M UTC")
+    in_window = is_starting_soon(utc, max_minutes=NOTIFY_WINDOW_BEFORE, grace_minutes=NOTIFY_WINDOW_AFTER)
+    state = "IN FINESTRA" if in_window else "fuori finestra"
+    return f"• {home} - {away}: inizio {local} ora italiana (tra {minutes} min) - {state}"
+
+
+def europa_test_report(candidates: list, primary: str, backup: str, errors: dict) -> str:
+    """Messaggio del test manuale: stato di ciascuna fonte e partite trovate."""
+    lines = ["🧪 <b>TEST • EUROPA LEAGUE JUVENTUS</b>", ""]
+    for label, source_id, status in (
+        ("Footballdata.io", "footballdata.io", primary),
+        ("TheSportsDB (riserva)", "TheSportsDB", backup),
+    ):
+        own = [c for c in candidates if c["source"] == source_id]
+        error_key = "footballdata.io" if source_id == "footballdata.io" else "TheSportsDB"
+        if status == "ok":
+            summary = "✅ risponde" + ("" if own else " - nessuna partita Juventus oggi")
+        elif status == "errore":
+            summary = f"❌ errore ({html.escape(errors.get(error_key, '?'))})"
+        else:
+            summary = f"⏭️ non usata ({html.escape(errors.get(error_key, 'saltata'))})"
+        lines.append(f"<b>{label}</b>: {summary}")
+        lines.extend(describe_europa_candidate(c) for c in own)
+    return "\n".join(lines)
+
+
+def send_europa_alert(candidate: dict) -> None:
+    send_telegram_message(
+        format_prematch(
+            "🏆 <b>EUROPA LEAGUE</b>",
+            candidate["home"],
+            candidate["away"],
+            candidate["utc"],
+            candidate["detail"],
+            candidate["attribution"],
+        )
+    )
+
+
 def notify_juventus_europa(notified: set, force=False) -> bool:
     weekday = datetime.now(timezone.utc).weekday()
 
@@ -503,80 +750,62 @@ def notify_juventus_europa(notified: set, force=False) -> bool:
         return False
 
     today = datetime.now(timezone.utc).date().isoformat()
-    matches = get_juventus_europa_matches(today)
 
-    print(f"[EUROPA LEAGUE] Data controllo: {today} - partite Juventus trovate: {len(matches)}")
-
-    if force and not matches:
-        send_telegram_message(
-            "🧪 <b>TEST • EUROPA LEAGUE JUVENTUS</b>\n\n"
-            "✅ Footballdata.io collegato.\n"
-            "Nessuna partita Juventus trovata per oggi."
-        )
+    # Risparmio di richieste API (footballdata.io ha un limite mensile):
+    #  - uel_none:<data> = oggi la Juventus non gioca in Europa League
+    #  - uel_done:<data> = l'avviso di oggi e' gia' partito (qualunque fonte)
+    # In entrambi i casi non serve richiamare le API per il resto della giornata.
+    none_key = f"uel_none:{today}"
+    done_key = f"uel_done:{today}"
+    if not force and (none_key in notified or done_key in notified):
+        print("[EUROPA LEAGUE] Giornata gia' risolta: non chiamo le API")
         return False
 
-    changed = False
-    any_in_window = False
+    candidates, primary, backup, errors, changed = query_europa_sources(today, notified, force)
 
-    for match in matches:
-        match_id = match.get("match_id") or match.get("id")
-        home = footballdata_team_name(match.get("home_team"))
-        away = footballdata_team_name(match.get("away_team"))
+    print(
+        f"[EUROPA LEAGUE] Data controllo: {today} - footballdata.io={primary} "
+        f"TheSportsDB={backup} - partite Juventus trovate: {len(candidates)}"
+    )
 
-        utc_date = footballdata_match_start(match)
-        in_window = is_starting_soon(utc_date, max_minutes=NOTIFY_WINDOW_BEFORE, grace_minutes=NOTIFY_WINDOW_AFTER)
+    # --- test manuale: rapporto su entrambe le fonti ---
+    if force:
+        send_telegram_message(europa_test_report(candidates, primary, backup, errors))
+        for candidate in candidates:
+            if candidate["utc"] and is_starting_soon(
+                candidate["utc"], max_minutes=NOTIFY_WINDOW_BEFORE, grace_minutes=NOTIFY_WINDOW_AFTER
+            ):
+                send_europa_alert(candidate)  # anteprima dell'avviso vero
+                break
+        if primary != "ok" and backup != "ok":
+            raise RuntimeError(f"Nessuna fonte ha risposto: {errors}")
+        return False
 
+    # --- funzionamento automatico ---
+    if not candidates:
+        # Almeno una fonte ha risposto "oggi niente": ci fermiamo per oggi.
+        if primary == "ok" or backup == "ok":
+            notified.add(none_key)
+            return True
+        # Nessuna fonte ha risposto: si riprova alla prossima run.
+        return changed
+
+    for candidate in candidates:
+        in_window = is_starting_soon(
+            candidate["utc"], max_minutes=NOTIFY_WINDOW_BEFORE, grace_minutes=NOTIFY_WINDOW_AFTER
+        )
         print(
-            f"[EUROPA LEAGUE] {match_id} | {home} - {away} | "
-            f"finestra 45min={in_window} | utc={utc_date}"
+            f"[EUROPA LEAGUE] {candidate['key']} ({candidate['source']}) | "
+            f"{candidate['home']} - {candidate['away']} | in finestra={in_window} | utc={candidate['utc']}"
         )
-
-        if match_id is None:
+        if candidate["key"] in notified or not in_window:
             continue
 
-        key = f"uel_pre:{match_id}"
-        if key in notified:
-            continue
-        if not in_window:
-            continue
-
-        any_in_window = True
-        round_name = match.get("round") or match.get("game_week")
-        detail = f"📅 {round_name}" if round_name else None
-
-        message = format_prematch(
-            "🏆 <b>EUROPA LEAGUE</b>",
-            home,
-            away,
-            utc_date,
-            detail,
-            "Dati: Footballdata.io",
-        )
-
-        send_telegram_message(message)
-        notified.add(key)
+        send_europa_alert(candidate)
+        notified.add(candidate["key"])
+        notified.add(done_key)
         changed = True
-
-    # Test forzato: la partita è stata trovata ma è fuori dalla finestra dei 45 minuti
-    # (già iniziata, o troppo lontana) -> altrimenti il test restava muto e sembrava rotto.
-    if force and matches and not any_in_window:
-        lines = [
-            "🧪 <b>TEST • EUROPA LEAGUE JUVENTUS</b>",
-            "",
-            f"✅ Footballdata.io collegato. Partita trovata, ma fuori dalla finestra prepartita ({NOTIFY_WINDOW_BEFORE} min):",
-        ]
-        for match in matches:
-            home = footballdata_team_name(match.get("home_team"))
-            away = footballdata_team_name(match.get("away_team"))
-            utc_date = footballdata_match_start(match)
-            if utc_date:
-                lines.append(f"• {home} - {away} (orario UTC: {utc_date})")
-            else:
-                lines.append(
-                    f"• {home} - {away} ⚠️ ORARIO NON LEGGIBILE - campi ricevuti: "
-                    + ", ".join(sorted(match.keys()))
-                )
-        send_telegram_message("\n".join(lines))
+        break  # un solo avviso per giornata, qualunque sia la fonte
 
     return changed
 
@@ -654,8 +883,9 @@ def notify_juventus_coppa(notified: set, force=False) -> bool:
         if key in notified:
             continue
 
-        # TheSportsDB salva la data in UTC in strTimestamp
-        utc_date = event.get("strTimestamp")
+        # TheSportsDB salva la data in UTC in strTimestamp, ma senza fuso orario
+        # ("2026-01-14T20:00:00"): va normalizzata, altrimenti la finestra non scatta mai.
+        utc_date = sportsdb_event_start(event)
         
         if not is_starting_soon(utc_date, max_minutes=NOTIFY_WINDOW_BEFORE, grace_minutes=NOTIFY_WINDOW_AFTER):
             continue
@@ -747,18 +977,36 @@ def test_juve_trasferta_all() -> None:
         "idLeague": COPPA_ITALIA_ID,
         "strHomeTeam": "Inter",
         "strAwayTeam": "Juventus FC",
-        "strTimestamp": fake_time,
+        # formato reale di TheSportsDB: UTC senza fuso
+        "strTimestamp": (datetime.now(timezone.utc) + timedelta(minutes=20)).strftime("%Y-%m-%dT%H:%M:%S"),
         "strRound": "Test trasferta",
     }
     assert not is_juventus(coppa_event["strHomeTeam"]), "Coppa Italia: la squadra di casa è stata riconosciuta erroneamente come Juventus"
     assert is_juventus_coppa_event(coppa_event), "Coppa Italia: Juventus ospite NON riconosciuta"
-    assert is_starting_soon(fake_time, max_minutes=45), "Coppa Italia: test finestra 45 minuti fallito"
+    assert is_starting_soon(
+        sportsdb_event_start(coppa_event), max_minutes=45
+    ), "Coppa Italia: orario (strTimestamp senza fuso) non letto o fuori finestra"
+
+    # Europa League, fonte di riserva TheSportsDB (stessa forma dati)
+    europa_backup_event = {
+        "idEvent": "990004",
+        "idLeague": EUROPA_LEAGUE_SPORTSDB_ID,
+        "strHomeTeam": "Celta Vigo",
+        "strAwayTeam": "Juventus",
+        "strTimestamp": coppa_event["strTimestamp"],
+        "intRound": "2",
+    }
+    assert is_juventus_sportsdb_event(europa_backup_event, EUROPA_LEAGUE_SPORTSDB_ID), \
+        "Europa League (TheSportsDB): Juventus ospite NON riconosciuta"
+    assert is_starting_soon(
+        sportsdb_event_start(europa_backup_event), max_minutes=45
+    ), "Europa League (TheSportsDB): orario non letto o fuori finestra"
     send_telegram_message(
         format_prematch(
             "🧪 <b>TEST TRASFERTA • COPPA ITALIA</b>",
             coppa_event["strHomeTeam"],
             coppa_event["strAwayTeam"],
-            fake_time,
+            sportsdb_event_start(coppa_event),
             "✅ Juventus riconosciuta come squadra ospite",
         )
     )
@@ -793,14 +1041,19 @@ def main() -> None:
     notified = load_notified()
     changed = False
 
-    if notify_serie_a(notified):
-        changed = True
-
-    if notify_juventus_europa(notified):
-        changed = True
-
-    if notify_juventus_coppa(notified):
-        changed = True
+    # Ogni fonte e' isolata: se una API fallisce (es. 429 = limite richieste)
+    # le altre notifiche partono lo stesso e lo stato viene comunque salvato.
+    # L'errore resta visibile come avviso (annotazione) nella pagina della run.
+    for label, step in (
+        ("SERIE A", notify_serie_a),
+        ("EUROPA LEAGUE", notify_juventus_europa),
+        ("COPPA ITALIA", notify_juventus_coppa),
+    ):
+        try:
+            if step(notified):
+                changed = True
+        except Exception as error:
+            print(f"::warning title={label} fallita::{type(error).__name__}: {error}")
 
     if changed:
         save_notified(notified)
