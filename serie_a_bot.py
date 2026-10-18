@@ -422,6 +422,35 @@ def footballdata_team_name(team) -> str:
         return team.get("team_name") or team.get("name") or ""
     return str(team or "")
 
+def footballdata_match_start(match: dict):
+    """Orario d'inizio (ISO 8601 UTC) di una partita di footballdata.io, oppure None.
+
+    footballdata.io NON usa starting_at / date / utc_date: l'orario e' nel campo
+    `date_unix` (timestamp UNIX in secondi, UTC). Teniamo anche qualche campo ISO
+    come ripiego, normalizzando sempre a un datetime con fuso orario (UTC).
+    """
+    unix_value = match.get("date_unix")
+    if unix_value not in (None, ""):
+        try:
+            return datetime.fromtimestamp(int(unix_value), tz=timezone.utc).isoformat()
+        except (TypeError, ValueError, OverflowError, OSError):
+            pass
+
+    for key in ("starting_at", "utc_date", "utcDate", "kickoff", "date"):
+        value = match.get(key)
+        # Scartiamo le date "nude" (YYYY-MM-DD): non contengono l'ora.
+        if isinstance(value, str) and len(value) > 10:
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc).isoformat()
+
+    return None
+
+
 def is_europa_league(match: dict) -> bool:
     league = match.get("league", {})
     if isinstance(league, dict):
@@ -494,8 +523,7 @@ def notify_juventus_europa(notified: set, force=False) -> bool:
         home = footballdata_team_name(match.get("home_team"))
         away = footballdata_team_name(match.get("away_team"))
 
-        # In footballdata.io, la data può essere su starting_at, date, o utcDate
-        utc_date = match.get("starting_at") or match.get("date") or match.get("utc_date")
+        utc_date = footballdata_match_start(match)
         in_window = is_starting_soon(utc_date, max_minutes=NOTIFY_WINDOW_BEFORE, grace_minutes=NOTIFY_WINDOW_AFTER)
 
         print(
@@ -535,13 +563,19 @@ def notify_juventus_europa(notified: set, force=False) -> bool:
         lines = [
             "🧪 <b>TEST • EUROPA LEAGUE JUVENTUS</b>",
             "",
-            "✅ Footballdata.io collegato. Partita trovata, ma fuori dalla finestra prepartita (45 min):",
+            f"✅ Footballdata.io collegato. Partita trovata, ma fuori dalla finestra prepartita ({NOTIFY_WINDOW_BEFORE} min):",
         ]
         for match in matches:
             home = footballdata_team_name(match.get("home_team"))
             away = footballdata_team_name(match.get("away_team"))
-            utc_date = match.get("starting_at") or match.get("date") or match.get("utc_date")
-            lines.append(f"• {home} - {away} (orario: {utc_date})")
+            utc_date = footballdata_match_start(match)
+            if utc_date:
+                lines.append(f"• {home} - {away} (orario UTC: {utc_date})")
+            else:
+                lines.append(
+                    f"• {home} - {away} ⚠️ ORARIO NON LEGGIBILE - campi ricevuti: "
+                    + ", ".join(sorted(match.keys()))
+                )
         send_telegram_message("\n".join(lines))
 
     return changed
@@ -686,15 +720,16 @@ def test_juve_trasferta_all() -> None:
         "home_team": {"team_name": "Olympique de Marseille"},
         "away_team": {"team_name": "Juventus FC"},
         "league": {"name": "UEFA Europa League"},
-        "starting_at": fake_time,
-        "round": "Test trasferta",
+        "date_unix": int(datetime.fromisoformat(fake_time).timestamp()),
     }
     home_el = footballdata_team_name(europa_match["home_team"])
     away_el = footballdata_team_name(europa_match["away_team"])
     assert is_europa_league(europa_match), "Europa League: competizione non riconosciuta"
     assert not is_juventus(home_el), "Europa League: la squadra di casa è stata riconosciuta erroneamente come Juventus"
     assert is_juventus(away_el), "Europa League: Juventus ospite NON riconosciuta"
-    assert is_starting_soon(fake_time, max_minutes=45), "Europa League: test finestra 45 minuti fallito"
+    assert is_starting_soon(
+        footballdata_match_start(europa_match), max_minutes=45
+    ), "Europa League: orario (date_unix) non letto o fuori finestra"
     send_telegram_message(
         format_prematch(
             "🧪 <b>TEST TRASFERTA • EUROPA LEAGUE</b>",
