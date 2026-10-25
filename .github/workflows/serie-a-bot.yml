@@ -1,4 +1,36 @@
-required: false
+name: Serie A Bot
+
+on:
+  workflow_dispatch:
+    inputs:
+
+      test_telegram:
+        description: "Invia un messaggio Telegram di prova"
+        required: false
+        default: false
+        type: boolean
+
+      test_last_match:
+        description: "Test ultima partita Serie A"
+        required: false
+        default: false
+        type: boolean
+
+      test_serie_a_today:
+        description: "Controlla partite reali Juventus di oggi (invia diagnostica Telegram)"
+        required: false
+        default: false
+        type: boolean
+
+      test_juve_europa:
+        description: "Test Juventus Europa League"
+        required: false
+        default: false
+        type: boolean
+
+      test_juve_coppa:
+        description: "Test Juventus Coppa Italia"
+        required: false
         default: false
         type: boolean
 
