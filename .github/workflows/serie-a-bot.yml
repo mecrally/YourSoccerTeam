@@ -1,36 +1,4 @@
-name: Serie A Bot
-
-on:
-  workflow_dispatch:
-    inputs:
-
-      test_telegram:
-        description: "Invia un messaggio Telegram di prova"
-        required: false
-        default: false
-        type: boolean
-
-      test_last_match:
-        description: "Test ultima partita Serie A"
-        required: false
-        default: false
-        type: boolean
-
-      test_last_match:
-        description: "Test ultima partita Serie A"
-        required: false
-        default: false
-        type: boolean
-
-      test_juve_europa:
-        description: "Test Juventus Europa League"
-        required: false
-        default: false
-        type: boolean
-
-      test_juve_coppa:
-        description: "Test Juventus Coppa Italia"
-        required: false
+required: false
         default: false
         type: boolean
 
@@ -88,6 +56,7 @@ jobs:
 
           # Test
           TEST_LAST_FINISHED: ${{ inputs.test_last_match }}
+          TEST_SERIE_A_TODAY: ${{ inputs.test_serie_a_today }}
           TEST_JUVE_EUROPA: ${{ inputs.test_juve_europa }}
           TEST_JUVE_COPPA: ${{ inputs.test_juve_coppa }}
 
@@ -96,7 +65,7 @@ jobs:
 
       - name: Salva le partite già notificate
 
-        if: ${{ github.event_name != 'workflow_dispatch' || (inputs.test_telegram != true && inputs.test_last_match != true && inputs.test_juve_europa != true && inputs.test_juve_coppa != true) }}
+        if: ${{ github.event_name != 'workflow_dispatch' || (inputs.test_telegram != true && inputs.test_last_match != true && inputs.test_serie_a_today != true && inputs.test_juve_europa != true && inputs.test_juve_coppa != true) }}
 
         run: |
 
