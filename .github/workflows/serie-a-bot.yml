@@ -1,15 +1,17 @@
 name: Serie A Bot
 
 on:
-  schedule:
-    # Ogni 15 minuti dalle 10:00 alle 23:59 UTC
-    - cron: "*/15 10-23 * * *"
-
   workflow_dispatch:
     inputs:
 
       test_telegram:
         description: "Invia un messaggio Telegram di prova"
+        required: false
+        default: false
+        type: boolean
+
+      test_last_match:
+        description: "Test ultima partita Serie A"
         required: false
         default: false
         type: boolean
