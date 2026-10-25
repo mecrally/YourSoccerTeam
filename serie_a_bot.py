@@ -28,6 +28,11 @@ TEST_LAST_FINISHED = (
     os.getenv("TEST_LAST_FINISHED", "false").lower() == "true"
 )
 
+# Diagnosi manuale del calendario REALE di oggi (nessun avviso di partita finto).
+TEST_SERIE_A_TODAY = (
+    os.getenv("TEST_SERIE_A_TODAY", "false").lower() == "true"
+)
+
 TEST_JUVE_EUROPA = (
     os.getenv("TEST_JUVE_EUROPA", "false").lower() == "true"
 )
@@ -47,7 +52,7 @@ NOTIFIED_FILE = "notified.json"
 # di far scattare il workflow con un trigger esterno affidabile (vedi sotto)
 # invece che con lo `schedule:` nativo di GitHub, che salta spesso per ore.
 NOTIFY_WINDOW_BEFORE = int(os.getenv("NOTIFY_WINDOW_BEFORE_MIN", "30"))  # minuti prima del fischio d'inizio
-NOTIFY_WINDOW_AFTER = int(os.getenv("NOTIFY_WINDOW_AFTER_MIN", "10"))   # piccola tolleranza dopo
+NOTIFY_WINDOW_AFTER = int(os.getenv("NOTIFY_WINDOW_AFTER_MIN", "120"))   # recupero se GitHub Actions viene eseguito in ritardo
 
 
 # ============================================================
@@ -302,19 +307,32 @@ def send_telegram_message(text: str) -> None:
 # ============================================================
 
 def get_serie_a_matches(date_string=None) -> list:
+    """Partite del giorno richiesto tramite football-data.org API v4.
+
+    IMPORTANTE: in API v4 `dateTo` è ESCLUSIVO: dateFrom=dateTo
+    restituisce un intervallo vuoto! Serve impostarlo al giorno successivo.
+    Doc: https://docs.football-data.org/general/v4/
+    """
     params = {}
     if date_string:
-        params["dateFrom"] = date_string
-        params["dateTo"] = date_string
+        requested_day = datetime.strptime(date_string, "%Y-%m-%d").date()
+        params["dateFrom"] = requested_day.isoformat()
+        params["dateTo"] = (requested_day + timedelta(days=1)).isoformat()
 
+    print(f"[SERIE A] Richiesta football-data.org: {params}")
     response = requests.get(
         f"{FOOTBALL_DATA_BASE}/competitions/SA/matches",
         headers=FOOTBALL_DATA_HEADERS,
         params=params,
         timeout=20,
     )
+    if response.status_code >= 400:
+        print(f"[SERIE A] API HTTP {response.status_code}: {response.text[:300]}")
     response.raise_for_status()
-    return response.json().get("matches", [])
+    payload = response.json()
+    matches = payload.get("matches", [])
+    print(f"[SERIE A] API OK: ricevute {len(matches)} partite, filtri={payload.get('filters', {})}")
+    return matches
 
 def notify_serie_a(notified: set) -> bool:
     # Usiamo la data italiana: è il calendario che interessa all'utente.
@@ -356,9 +374,14 @@ def notify_serie_a(notified: set) -> bool:
             continue
 
         detail = f"📅 Giornata {match['matchday']}" if match.get("matchday") else None
+        # Se il pianificatore è in ritardo, NON simulare una notifica prepartita.
+        match_start = datetime.fromisoformat(utc_date.replace("Z", "+00:00"))
+        delayed = datetime.now(timezone.utc) > match_start
+        if delayed:
+            detail = (detail + "\n" if detail else "") + "⚠️ Avviso recuperato dopo il calcio d'inizio"
 
         message = format_prematch(
-            "⚽️ <b>SERIE A</b>",
+            "⚽️ <b>SERIE A • AVVISO IN RITARDO</b>" if delayed else "⚽️ <b>SERIE A</b>",
             home_name,
             away_name,
             utc_date,
@@ -371,6 +394,44 @@ def notify_serie_a(notified: set) -> bool:
         print(f"[SERIE A] Notifica inviata: {key}")
 
     return changed
+
+
+def test_real_serie_a_today() -> None:
+    """Verifica IL CALENDARIO REALE di oggi: utile per trovare problemi API/data/filtri.
+
+    Non modifica notified.json e non simula né invia avvisi di partite fittizie.
+    """
+    now = datetime.now(timezone.utc)
+    italian_now = now.astimezone(ITALY_TZ) if ITALY_TZ else now
+    today = italian_now.date().isoformat()
+    matches = get_serie_a_matches(today)
+    juventus_matches = [
+        m for m in matches
+        if is_juventus_team(m.get("homeTeam")) or is_juventus_team(m.get("awayTeam"))
+    ]
+    notified = load_notified()
+    lines = [
+        "🔎 <b>CONTROLLO SERIE A • PARTITE REALI DI OGGI</b>",
+        f"📅 {today} • ore italiane {italian_now:%H:%M}",
+        f"✅ API raggiunta • {len(matches)} partite Serie A oggi",
+    ]
+    if not juventus_matches:
+        lines.append("❌ L'API non restituisce alcuna partita Juventus per oggi.")
+    for match in juventus_matches:
+        home = match.get("homeTeam", {}).get("name", "?")
+        away = match.get("awayTeam", {}).get("name", "?")
+        utc = match.get("utcDate")
+        kickoff = datetime.fromisoformat(utc.replace("Z", "+00:00")) if utc else None
+        local_time = kickoff.astimezone(ITALY_TZ).strftime("%H:%M") if (kickoff and ITALY_TZ) else (kickoff.strftime("%H:%M UTC") if kickoff else "orario assente")
+        match_key = f"sa_pre:{match.get('id')}"
+        in_window = is_starting_soon(utc, max_minutes=NOTIFY_WINDOW_BEFORE, grace_minutes=NOTIFY_WINDOW_AFTER)
+        state = "già notificata" if match_key in notified else ("in finestra, da notificare" if in_window else "fuori dalla finestra d'avviso")
+        lines.extend([
+            f"⚽ <b>{html.escape(home)} - {html.escape(away)}</b>",
+            f"🕒 {local_time} • giornata {match.get('matchday', '?')} • ID {match.get('id', '?')}",
+            f"📌 {state} • stato API: {html.escape(str(match.get('status', '?')))}",
+        ])
+    send_telegram_message("\n".join(lines))
 
 
 def test_last_serie_a() -> None:
@@ -1025,6 +1086,10 @@ def main() -> None:
         test_juve_trasferta_all()
         return
 
+    if TEST_SERIE_A_TODAY:
+        test_real_serie_a_today()
+        return
+
     if TEST_LAST_FINISHED:
         test_last_serie_a()
         return
@@ -1040,10 +1105,11 @@ def main() -> None:
     # Funzionamento automatico
     notified = load_notified()
     changed = False
+    errors = []
 
-    # Ogni fonte e' isolata: se una API fallisce (es. 429 = limite richieste)
-    # le altre notifiche partono lo stesso e lo stato viene comunque salvato.
-    # L'errore resta visibile come avviso (annotazione) nella pagina della run.
+    # Ogni fonte è isolata: se una API fallisce, tentiamo comunque le altre.
+    # Alla fine, però, l'azione deve risultare ROSSA in caso di vero errore:
+    # una run verde non deve nascondere notifiche non inviate.
     for label, step in (
         ("SERIE A", notify_serie_a),
         ("EUROPA LEAGUE", notify_juventus_europa),
@@ -1053,10 +1119,13 @@ def main() -> None:
             if step(notified):
                 changed = True
         except Exception as error:
-            print(f"::warning title={label} fallita::{type(error).__name__}: {error}")
+            print(f"::error title={label} fallita::{type(error).__name__}: {error}")
+            errors.append(f"{label}: {type(error).__name__}: {error}")
 
     if changed:
         save_notified(notified)
+    if errors:
+        raise RuntimeError("Alcune notifiche non sono state controllate: " + "; ".join(errors))
 
 if __name__ == "__main__":
     main()
